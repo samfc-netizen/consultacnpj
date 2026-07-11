@@ -3,6 +3,11 @@ import pandas as pd
 import requests
 import re
 import time
+import os
+import json
+import sqlite3
+import hashlib
+from datetime import datetime
 from io import BytesIO
 from typing import Dict, Any, Tuple, Optional, List
 
@@ -18,6 +23,10 @@ st.set_page_config(
 
 USUARIO_PADRAO = "samuel"
 SENHA_PADRAO = "samuel"
+
+# O arquivo SQLite é criado no ambiente onde o Streamlit está rodando.
+# Em produção, defina CNPJ_DB_PATH para um volume persistente.
+DB_PATH = os.getenv("CNPJ_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cnpj_intelligence.db"))
 
 # =========================================================
 # CSS - VISUAL DE SOFTWARE
@@ -502,6 +511,279 @@ def gerar_excel(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 # =========================================================
+# PERSISTÊNCIA SQLITE
+# =========================================================
+def agora_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def conectar_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def inicializar_db() -> None:
+    with conectar_db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                arquivo_nome TEXT NOT NULL,
+                total INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'PENDENTE',
+                criado_em TEXT NOT NULL,
+                atualizado_em TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS job_items (
+                job_id TEXT NOT NULL,
+                linha INTEGER NOT NULL,
+                cnpj TEXT NOT NULL,
+                entrada_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDENTE',
+                tentativas INTEGER NOT NULL DEFAULT 0,
+                resultado_json TEXT,
+                erro TEXT,
+                atualizado_em TEXT NOT NULL,
+                PRIMARY KEY (job_id, linha),
+                FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_job_items_status
+            ON job_items(job_id, status, linha);
+
+            CREATE INDEX IF NOT EXISTS idx_job_items_cnpj
+            ON job_items(cnpj);
+
+            CREATE TABLE IF NOT EXISTS cnpj_cache (
+                cnpj TEXT PRIMARY KEY,
+                resultado_json TEXT NOT NULL,
+                fonte TEXT,
+                atualizado_em TEXT NOT NULL
+            );
+            """
+        )
+
+
+def criar_job_id(conteudo: bytes, coluna_cnpj: str, coluna_telefone: str, coluna_email: str) -> str:
+    h = hashlib.sha256()
+    h.update(conteudo)
+    h.update(f"|{coluna_cnpj}|{coluna_telefone}|{coluna_email}".encode("utf-8"))
+    return h.hexdigest()[:24]
+
+
+def preparar_job(
+    job_id: str,
+    arquivo_nome: str,
+    df: pd.DataFrame,
+    coluna_cnpj: str,
+    coluna_telefone: str,
+    coluna_email: str,
+) -> None:
+    momento = agora_iso()
+    with conectar_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs(job_id, arquivo_nome, total, status, criado_em, atualizado_em)
+            VALUES (?, ?, ?, 'PENDENTE', ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                arquivo_nome=excluded.arquivo_nome,
+                total=excluded.total,
+                atualizado_em=excluded.atualizado_em
+            """,
+            (job_id, arquivo_nome, len(df), momento, momento),
+        )
+
+        registros = []
+        for linha_num, (_, linha) in enumerate(df.iterrows()):
+            entrada = {str(k): ("" if pd.isna(v) else str(v)) for k, v in linha.to_dict().items()}
+            entrada["Telefone Upload"] = entrada.get(coluna_telefone, "") if coluna_telefone != "Não usar" else ""
+            entrada["E-mail Upload"] = entrada.get(coluna_email, "") if coluna_email != "Não usar" else ""
+            cnpj_limpo = limpar_cnpj(entrada.get(coluna_cnpj, ""))
+            registros.append((job_id, linha_num, cnpj_limpo, json.dumps(entrada, ensure_ascii=False), momento))
+
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO job_items
+                (job_id, linha, cnpj, entrada_json, status, tentativas, atualizado_em)
+            VALUES (?, ?, ?, ?, 'PENDENTE', 0, ?)
+            """,
+            registros,
+        )
+
+
+def resumo_job(job_id: str) -> Dict[str, int]:
+    with conectar_db() as conn:
+        linhas = conn.execute(
+            """
+            SELECT status, COUNT(*) AS qtd
+            FROM job_items
+            WHERE job_id = ?
+            GROUP BY status
+            """,
+            (job_id,),
+        ).fetchall()
+    resumo = {"PENDENTE": 0, "PROCESSANDO": 0, "CONCLUIDO": 0, "ERRO": 0}
+    for linha in linhas:
+        resumo[linha["status"]] = int(linha["qtd"])
+    resumo["TOTAL"] = sum(resumo.values())
+    return resumo
+
+
+def recuperar_processando_interrompido(job_id: str) -> None:
+    with conectar_db() as conn:
+        conn.execute(
+            """
+            UPDATE job_items
+            SET status='PENDENTE', atualizado_em=?
+            WHERE job_id=? AND status='PROCESSANDO'
+            """,
+            (agora_iso(), job_id),
+        )
+
+
+def buscar_cache_sqlite(cnpj: str) -> Optional[Dict[str, Any]]:
+    if len(cnpj) != 14:
+        return None
+    with conectar_db() as conn:
+        linha = conn.execute(
+            "SELECT resultado_json FROM cnpj_cache WHERE cnpj=?",
+            (cnpj,),
+        ).fetchone()
+    if not linha:
+        return None
+    try:
+        return json.loads(linha["resultado_json"])
+    except Exception:
+        return None
+
+
+def salvar_cache_sqlite(cnpj: str, resultado: Dict[str, Any]) -> None:
+    if len(cnpj) != 14 or resultado.get("Erro Consulta"):
+        return
+    with conectar_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO cnpj_cache(cnpj, resultado_json, fonte, atualizado_em)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(cnpj) DO UPDATE SET
+                resultado_json=excluded.resultado_json,
+                fonte=excluded.fonte,
+                atualizado_em=excluded.atualizado_em
+            """,
+            (
+                cnpj,
+                json.dumps(resultado, ensure_ascii=False),
+                resultado.get("Fonte Consulta", ""),
+                agora_iso(),
+            ),
+        )
+
+
+def obter_itens_para_processar(job_id: str, limite: int, incluir_erros: bool = False) -> List[sqlite3.Row]:
+    status = ["PENDENTE"]
+    if incluir_erros:
+        status.append("ERRO")
+    placeholders = ",".join("?" for _ in status)
+    query = f"""
+        SELECT job_id, linha, cnpj, entrada_json, status, tentativas
+        FROM job_items
+        WHERE job_id=? AND status IN ({placeholders})
+        ORDER BY linha
+        LIMIT ?
+    """
+    with conectar_db() as conn:
+        return conn.execute(query, [job_id, *status, limite]).fetchall()
+
+
+def marcar_processando(job_id: str, linha: int) -> None:
+    with conectar_db() as conn:
+        conn.execute(
+            """
+            UPDATE job_items
+            SET status='PROCESSANDO', tentativas=tentativas+1, atualizado_em=?
+            WHERE job_id=? AND linha=?
+            """,
+            (agora_iso(), job_id, linha),
+        )
+
+
+def salvar_item_job(job_id: str, linha: int, resultado: Dict[str, Any]) -> None:
+    erro = str(resultado.get("Erro Consulta", "") or "")
+    status = "ERRO" if erro else "CONCLUIDO"
+    with conectar_db() as conn:
+        conn.execute(
+            """
+            UPDATE job_items
+            SET status=?, resultado_json=?, erro=?, atualizado_em=?
+            WHERE job_id=? AND linha=?
+            """,
+            (status, json.dumps(resultado, ensure_ascii=False), erro, agora_iso(), job_id, linha),
+        )
+        pendentes = conn.execute(
+            "SELECT COUNT(*) FROM job_items WHERE job_id=? AND status IN ('PENDENTE','PROCESSANDO')",
+            (job_id,),
+        ).fetchone()[0]
+        novo_status = "CONCLUIDO" if pendentes == 0 else "EM_ANDAMENTO"
+        conn.execute(
+            "UPDATE jobs SET status=?, atualizado_em=? WHERE job_id=?",
+            (novo_status, agora_iso(), job_id),
+        )
+
+
+def reabrir_erros(job_id: str) -> int:
+    with conectar_db() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE job_items
+            SET status='PENDENTE', erro=NULL, atualizado_em=?
+            WHERE job_id=? AND status='ERRO'
+            """,
+            (agora_iso(), job_id),
+        )
+        return int(cursor.rowcount or 0)
+
+
+def dataframe_job(job_id: str, somente_concluidos: bool = False) -> pd.DataFrame:
+    filtro = "AND status='CONCLUIDO'" if somente_concluidos else ""
+    with conectar_db() as conn:
+        linhas = conn.execute(
+            f"""
+            SELECT linha, entrada_json, resultado_json, status, tentativas, erro
+            FROM job_items
+            WHERE job_id=? {filtro}
+            ORDER BY linha
+            """,
+            (job_id,),
+        ).fetchall()
+
+    registros = []
+    for linha in linhas:
+        try:
+            entrada = json.loads(linha["entrada_json"] or "{}")
+        except Exception:
+            entrada = {}
+        try:
+            resultado = json.loads(linha["resultado_json"] or "{}")
+        except Exception:
+            resultado = {}
+        combinado = dict(entrada)
+        combinado.update(resultado)
+        combinado["Status Processamento"] = linha["status"]
+        combinado["Tentativas Processamento"] = linha["tentativas"]
+        if linha["erro"] and not combinado.get("Erro Consulta"):
+            combinado["Erro Consulta"] = linha["erro"]
+        registros.append(combinado)
+    return pd.DataFrame(registros)
+
+
+inicializar_db()
+
+# =========================================================
 # APIs E RETRY
 # =========================================================
 SESSION = requests.Session()
@@ -871,67 +1153,124 @@ if pagina == "Consulta e Enriquecimento":
         st.dataframe(df.head(30), use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-        if st.button("🚀 Iniciar consulta", type="primary", use_container_width=True):
-            resultados = []
-            cache = {}
-            total = len(df)
+        conteudo_arquivo = arquivo.getvalue()
+        job_id = criar_job_id(conteudo_arquivo, coluna_cnpj, coluna_telefone, coluna_email)
+        preparar_job(job_id, arquivo.name, df, coluna_cnpj, coluna_telefone, coluna_email)
+        recuperar_processando_interrompido(job_id)
+        st.session_state["job_id_atual"] = job_id
+
+        st.markdown('<div class="main-card">', unsafe_allow_html=True)
+        st.subheader("Processamento persistente")
+        st.caption(f"Identificador: {job_id} • Banco: {os.path.basename(DB_PATH)}")
+
+        limite_execucao = st.number_input(
+            "Quantidade máxima de CNPJs nesta execução",
+            min_value=1,
+            max_value=max(1, len(df)),
+            value=min(500, max(1, len(df))),
+            step=100 if len(df) >= 100 else 1,
+            help="Cada resultado é salvo imediatamente. Execute novamente para continuar os pendentes.",
+        )
+
+        resumo_atual = resumo_job(job_id)
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: card_metric("Total", f"{resumo_atual['TOTAL']:,}".replace(",", "."))
+        with c2: card_metric("Concluídos", f"{resumo_atual['CONCLUIDO']:,}".replace(",", "."))
+        with c3: card_metric("Pendentes", f"{resumo_atual['PENDENTE']:,}".replace(",", "."))
+        with c4: card_metric("Erros", f"{resumo_atual['ERRO']:,}".replace(",", "."))
+
+        col_acao1, col_acao2 = st.columns(2)
+        iniciar = col_acao1.button(
+            "▶️ Iniciar / continuar consulta",
+            type="primary",
+            use_container_width=True,
+            disabled=resumo_atual["PENDENTE"] == 0,
+        )
+        repro_erros = col_acao2.button(
+            "↻ Colocar erros na fila novamente",
+            use_container_width=True,
+            disabled=resumo_atual["ERRO"] == 0,
+        )
+
+        if repro_erros:
+            quantidade = reabrir_erros(job_id)
+            st.success(f"{quantidade} registro(s) com erro voltaram para a fila.")
+            st.rerun()
+
+        if iniciar:
+            itens = obter_itens_para_processar(job_id, int(limite_execucao), incluir_erros=False)
+            total_lote = len(itens)
             barra = st.progress(0)
-            status = st.empty()
-            resumo = st.empty()
+            status_box = st.empty()
+            resumo_box = st.empty()
 
-            qtd_brasilapi = 0
-            qtd_minha = 0
-            qtd_cache = 0
-            qtd_erro = 0
+            for posicao, item in enumerate(itens, start=1):
+                cnpj_limpo = item["cnpj"]
+                marcar_processando(job_id, int(item["linha"]))
+                status_box.info(
+                    f"Consultando {posicao} de {total_lote} neste lote: {formatar_cnpj(cnpj_limpo)}"
+                )
 
-            for i, linha in df.iterrows():
-                cnpj_original = linha[coluna_cnpj]
-                cnpj_limpo = limpar_cnpj(cnpj_original)
-                status.info(f"Consultando {i + 1} de {total}: {formatar_cnpj(cnpj_limpo)}")
+                try:
+                    resultado = buscar_cache_sqlite(cnpj_limpo) if ignorar_duplicados else None
+                    if resultado:
+                        resultado = resultado.copy()
+                        fonte_original = resultado.get("Fonte Consulta", "")
+                        resultado["Fonte Consulta"] = f"{fonte_original} (cache SQLite)".strip()
+                    else:
+                        resultado = consultar_cnpj(
+                            cnpj_limpo,
+                            int(tentativas),
+                            float(espera_429),
+                            usar_fallback,
+                        )
+                        salvar_cache_sqlite(cnpj_limpo, resultado)
+                except Exception as exc:
+                    resultado = resposta_vazia(cnpj_limpo, f"Erro inesperado: {exc}")
 
-                if ignorar_duplicados and cnpj_limpo in cache:
-                    resultado = cache[cnpj_limpo].copy()
-                    resultado["Fonte Consulta"] = f"{resultado.get('Fonte Consulta', '')} (cache)".strip()
-                    qtd_cache += 1
-                else:
-                    resultado = consultar_cnpj(cnpj_original, int(tentativas), float(espera_429), usar_fallback)
-                    if ignorar_duplicados and cnpj_limpo:
-                        cache[cnpj_limpo] = resultado.copy()
+                salvar_item_job(job_id, int(item["linha"]), resultado)
 
-                # Preserva telefone e e-mail do upload no resultado final.
-                resultado["Telefone Upload"] = linha[coluna_telefone] if coluna_telefone != "Não usar" else ""
-                resultado["E-mail Upload"] = linha[coluna_email] if coluna_email != "Não usar" else ""
+                if posicao == total_lote or posicao % 10 == 0:
+                    barra.progress(posicao / max(total_lote, 1))
+                    parcial = resumo_job(job_id)
+                    resumo_box.write(
+                        f"Concluídos: {parcial['CONCLUIDO']} | "
+                        f"Pendentes: {parcial['PENDENTE']} | Erros: {parcial['ERRO']}"
+                    )
 
-                fonte = resultado.get("Fonte Consulta", "")
-                erro = resultado.get("Erro Consulta", "")
-                if "BrasilAPI" in fonte and "cache" not in fonte:
-                    qtd_brasilapi += 1
-                elif "Minha Receita" in fonte and "cache" not in fonte:
-                    qtd_minha += 1
-                elif erro:
-                    qtd_erro += 1
-
-                resultados.append(resultado)
-                barra.progress((i + 1) / total)
-                resumo.write(f"BrasilAPI: {qtd_brasilapi} | Minha Receita: {qtd_minha} | Cache: {qtd_cache} | Erros: {qtd_erro}")
-                if tempo_entre_consultas > 0:
+                if tempo_entre_consultas > 0 and posicao < total_lote:
                     time.sleep(float(tempo_entre_consultas))
 
-            df_api = pd.DataFrame(resultados)
-            df_final = pd.concat([df.reset_index(drop=True), df_api.reset_index(drop=True)], axis=1)
-            df_final = separar_socios_em_colunas(df_final, "Sócios", max_socios=8)
-            st.session_state["df_resultado"] = df_final
+            st.success("Lote finalizado e salvo no SQLite.")
+            st.rerun()
 
-            st.success("Consulta finalizada.")
-            mostrar_kpis(df_final)
-            st.dataframe(df_final, use_container_width=True)
-            st.download_button(
-                "⬇️ Baixar Excel enriquecido",
-                data=gerar_excel(df_final),
-                file_name="cnpjs_enriquecidos_software.xlsx",
+        df_parcial = dataframe_job(job_id)
+        if not df_parcial.empty:
+            df_parcial = separar_socios_em_colunas(df_parcial, "Sócios", max_socios=8)
+            st.session_state["df_resultado"] = df_parcial
+            st.divider()
+            st.subheader("Resultado salvo")
+            st.dataframe(df_parcial.tail(200), use_container_width=True, hide_index=True)
+
+            col_down1, col_down2 = st.columns(2)
+            col_down1.download_button(
+                "⬇️ Baixar resultado atual",
+                data=gerar_excel(df_parcial),
+                file_name=f"cnpjs_enriquecidos_{job_id}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
+
+            df_erros = df_parcial[df_parcial.get("Status Processamento", "").eq("ERRO")].copy()
+            if not df_erros.empty:
+                col_down2.download_button(
+                    "⬇️ Baixar somente erros",
+                    data=gerar_excel(df_erros),
+                    file_name=f"cnpjs_erros_{job_id}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+        st.markdown('</div>', unsafe_allow_html=True)
 
 elif pagina == "Dashboard":
     hero()
