@@ -704,7 +704,7 @@ def salvar_cache_sqlite(cnpj: str, resultado: Dict[str, Any]) -> None:
         )
 
 
-def obter_itens_para_processar(job_id: str, limite: int, incluir_erros: bool = False) -> List[Dict[str, Any]]:
+def obter_itens_para_processar(job_id: str, incluir_erros: bool = False) -> List[Dict[str, Any]]:
     status = ["PENDENTE"]
     if incluir_erros:
         status.append("ERRO")
@@ -715,9 +715,8 @@ def obter_itens_para_processar(job_id: str, limite: int, incluir_erros: bool = F
             FROM public.job_items
             WHERE job_id=%s AND status = ANY(%s)
             ORDER BY linha
-            LIMIT %s
             """,
-            (job_id, status, limite),
+            (job_id, status),
         ).fetchall()
 
 
@@ -1203,13 +1202,10 @@ if pagina == "Consulta e Enriquecimento":
         st.subheader("Processamento persistente")
         st.caption(f"Identificador: {job_id} • Banco persistente: Supabase PostgreSQL")
 
-        limite_execucao = st.number_input(
-            "Quantidade máxima de CNPJs nesta execução",
-            min_value=1,
-            max_value=max(1, len(df)),
-            value=min(500, max(1, len(df))),
-            step=100 if len(df) >= 100 else 1,
-            help="Cada resultado é salvo imediatamente. Execute novamente para continuar os pendentes.",
+        st.info(
+            "O processamento seguirá continuamente até concluir todos os CNPJs pendentes. "
+            "Cada resultado é salvo imediatamente no Supabase. Se o Streamlit for interrompido, "
+            "abra novamente a mesma planilha e clique em **Iniciar / continuar processamento**."
         )
 
         resumo_atual = resumo_job(job_id)
@@ -1221,7 +1217,7 @@ if pagina == "Consulta e Enriquecimento":
 
         col_acao1, col_acao2 = st.columns(2)
         iniciar = col_acao1.button(
-            "▶️ Iniciar / continuar consulta",
+            "▶️ Iniciar / continuar processamento",
             type="primary",
             use_container_width=True,
             disabled=resumo_atual["PENDENTE"] == 0,
@@ -1238,9 +1234,11 @@ if pagina == "Consulta e Enriquecimento":
             st.rerun()
 
         if iniciar:
-            itens = obter_itens_para_processar(job_id, int(limite_execucao), incluir_erros=False)
-            total_lote = len(itens)
-            barra = st.progress(0)
+            itens = obter_itens_para_processar(job_id, incluir_erros=False)
+            total_pendentes_inicio = len(itens)
+            total_geral = max(1, resumo_atual["TOTAL"])
+            concluidos_inicio = resumo_atual["CONCLUIDO"]
+            barra = st.progress(concluidos_inicio / total_geral)
             status_box = st.empty()
             resumo_box = st.empty()
 
@@ -1248,7 +1246,8 @@ if pagina == "Consulta e Enriquecimento":
                 cnpj_limpo = item["cnpj"]
                 marcar_processando(job_id, int(item["linha"]))
                 status_box.info(
-                    f"Consultando {posicao} de {total_lote} neste lote: {formatar_cnpj(cnpj_limpo)}"
+                    f"Processando CNPJ {concluidos_inicio + posicao} de {total_geral}: "
+                    f"{formatar_cnpj(cnpj_limpo)}"
                 )
 
                 try:
@@ -1256,7 +1255,7 @@ if pagina == "Consulta e Enriquecimento":
                     if resultado:
                         resultado = resultado.copy()
                         fonte_original = resultado.get("Fonte Consulta", "")
-                        resultado["Fonte Consulta"] = f"{fonte_original} (cache SQLite)".strip()
+                        resultado["Fonte Consulta"] = f"{fonte_original} (cache Supabase)".strip()
                     else:
                         resultado = consultar_cnpj(
                             cnpj_limpo,
@@ -1270,18 +1269,21 @@ if pagina == "Consulta e Enriquecimento":
 
                 salvar_item_job(job_id, int(item["linha"]), resultado)
 
-                if posicao == total_lote or posicao % 10 == 0:
-                    barra.progress(posicao / max(total_lote, 1))
+                if posicao == total_pendentes_inicio or posicao % 10 == 0:
                     parcial = resumo_job(job_id)
+                    progresso_geral = min(1.0, parcial["CONCLUIDO"] / max(parcial["TOTAL"], 1))
+                    barra.progress(progresso_geral)
+                    percentual = progresso_geral * 100
                     resumo_box.write(
+                        f"Progresso geral: {percentual:.1f}% | "
                         f"Concluídos: {parcial['CONCLUIDO']} | "
                         f"Pendentes: {parcial['PENDENTE']} | Erros: {parcial['ERRO']}"
                     )
 
-                if tempo_entre_consultas > 0 and posicao < total_lote:
+                if tempo_entre_consultas > 0 and posicao < total_pendentes_inicio:
                     time.sleep(float(tempo_entre_consultas))
 
-            st.success("Lote finalizado e salvo no SQLite.")
+            st.success("Processamento finalizado e salvo no Supabase.")
             st.rerun()
 
         df_parcial = dataframe_job(job_id)
