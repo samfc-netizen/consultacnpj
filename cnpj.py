@@ -5,9 +5,11 @@ import re
 import time
 import os
 import json
-import sqlite3
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import Dict, Any, Tuple, Optional, List
 
@@ -24,9 +26,6 @@ st.set_page_config(
 USUARIO_PADRAO = "samuel"
 SENHA_PADRAO = "samuel"
 
-# O arquivo SQLite é criado no ambiente onde o Streamlit está rodando.
-# Em produção, defina CNPJ_DB_PATH para um volume persistente.
-DB_PATH = os.getenv("CNPJ_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cnpj_intelligence.db"))
 
 # =========================================================
 # CSS - VISUAL DE SOFTWARE
@@ -511,62 +510,70 @@ def gerar_excel(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 # =========================================================
-# PERSISTÊNCIA SQLITE
+# PERSISTÊNCIA SUPABASE / POSTGRESQL
 # =========================================================
-def agora_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+def agora_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def conectar_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    return conn
+def obter_database_url() -> str:
+    url = ""
+    try:
+        url = str(st.secrets.get("SUPABASE_DB_URL", "")).strip()
+    except Exception:
+        pass
 
+    if not url:
+        url = os.getenv("SUPABASE_DB_URL", "").strip()
 
-def inicializar_db() -> None:
-    with conectar_db() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS jobs (
-                job_id TEXT PRIMARY KEY,
-                arquivo_nome TEXT NOT NULL,
-                total INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'PENDENTE',
-                criado_em TEXT NOT NULL,
-                atualizado_em TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS job_items (
-                job_id TEXT NOT NULL,
-                linha INTEGER NOT NULL,
-                cnpj TEXT NOT NULL,
-                entrada_json TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'PENDENTE',
-                tentativas INTEGER NOT NULL DEFAULT 0,
-                resultado_json TEXT,
-                erro TEXT,
-                atualizado_em TEXT NOT NULL,
-                PRIMARY KEY (job_id, linha),
-                FOREIGN KEY (job_id) REFERENCES jobs(job_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_job_items_status
-            ON job_items(job_id, status, linha);
-
-            CREATE INDEX IF NOT EXISTS idx_job_items_cnpj
-            ON job_items(cnpj);
-
-            CREATE TABLE IF NOT EXISTS cnpj_cache (
-                cnpj TEXT PRIMARY KEY,
-                resultado_json TEXT NOT NULL,
-                fonte TEXT,
-                atualizado_em TEXT NOT NULL
-            );
-            """
+    if not url:
+        raise RuntimeError(
+            "SUPABASE_DB_URL não configurada. Cadastre a URI do Transaction Pooler "
+            "nos Secrets do Streamlit."
         )
+    return url
+
+
+def conectar_db():
+    return psycopg.connect(
+        obter_database_url(),
+        row_factory=dict_row,
+        connect_timeout=30,
+        prepare_threshold=None,
+    )
+
+
+def testar_conexao_db() -> Tuple[bool, str]:
+    try:
+        with conectar_db() as conn:
+            linha = conn.execute("SELECT 1 AS teste").fetchone()
+            if not linha or linha.get("teste") != 1:
+                return False, "O Supabase respondeu, mas o teste de conexão foi inválido."
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def validar_tabelas_db() -> Tuple[bool, str]:
+    tabelas = ("jobs", "job_items", "cnpj_cache")
+    try:
+        with conectar_db() as conn:
+            linhas = conn.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = ANY(%s)
+                """,
+                (list(tabelas),),
+            ).fetchall()
+        encontradas = {linha["table_name"] for linha in linhas}
+        faltantes = [t for t in tabelas if t not in encontradas]
+        if faltantes:
+            return False, "Tabelas ausentes no Supabase: " + ", ".join(faltantes)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
 
 
 def criar_job_id(conteudo: bytes, coluna_cnpj: str, coluna_telefone: str, coluna_email: str) -> str:
@@ -584,16 +591,16 @@ def preparar_job(
     coluna_telefone: str,
     coluna_email: str,
 ) -> None:
-    momento = agora_iso()
+    momento = agora_utc()
     with conectar_db() as conn:
         conn.execute(
             """
-            INSERT INTO jobs(job_id, arquivo_nome, total, status, criado_em, atualizado_em)
-            VALUES (?, ?, ?, 'PENDENTE', ?, ?)
+            INSERT INTO public.jobs(job_id, arquivo_nome, total, status, criado_em, atualizado_em)
+            VALUES (%s, %s, %s, 'PENDENTE', %s, %s)
             ON CONFLICT(job_id) DO UPDATE SET
-                arquivo_nome=excluded.arquivo_nome,
-                total=excluded.total,
-                atualizado_em=excluded.atualizado_em
+                arquivo_nome=EXCLUDED.arquivo_nome,
+                total=EXCLUDED.total,
+                atualizado_em=EXCLUDED.atualizado_em
             """,
             (job_id, arquivo_nome, len(df), momento, momento),
         )
@@ -604,16 +611,22 @@ def preparar_job(
             entrada["Telefone Upload"] = entrada.get(coluna_telefone, "") if coluna_telefone != "Não usar" else ""
             entrada["E-mail Upload"] = entrada.get(coluna_email, "") if coluna_email != "Não usar" else ""
             cnpj_limpo = limpar_cnpj(entrada.get(coluna_cnpj, ""))
-            registros.append((job_id, linha_num, cnpj_limpo, json.dumps(entrada, ensure_ascii=False), momento))
+            registros.append((job_id, linha_num, cnpj_limpo, Jsonb(entrada), momento))
 
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO job_items
-                (job_id, linha, cnpj, entrada_json, status, tentativas, atualizado_em)
-            VALUES (?, ?, ?, ?, 'PENDENTE', 0, ?)
-            """,
-            registros,
-        )
+        # Insere em blocos para evitar uma operação única excessivamente grande.
+        tamanho_bloco = 1000
+        for inicio in range(0, len(registros), tamanho_bloco):
+            bloco = registros[inicio:inicio + tamanho_bloco]
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    INSERT INTO public.job_items
+                        (job_id, linha, cnpj, entrada_json, status, tentativas, atualizado_em)
+                    VALUES (%s, %s, %s, %s, 'PENDENTE', 0, %s)
+                    ON CONFLICT(job_id, linha) DO NOTHING
+                    """,
+                    bloco,
+                )
 
 
 def resumo_job(job_id: str) -> Dict[str, int]:
@@ -621,8 +634,8 @@ def resumo_job(job_id: str) -> Dict[str, int]:
         linhas = conn.execute(
             """
             SELECT status, COUNT(*) AS qtd
-            FROM job_items
-            WHERE job_id = ?
+            FROM public.job_items
+            WHERE job_id = %s
             GROUP BY status
             """,
             (job_id,),
@@ -638,77 +651,85 @@ def recuperar_processando_interrompido(job_id: str) -> None:
     with conectar_db() as conn:
         conn.execute(
             """
-            UPDATE job_items
-            SET status='PENDENTE', atualizado_em=?
-            WHERE job_id=? AND status='PROCESSANDO'
+            UPDATE public.job_items
+            SET status='PENDENTE', atualizado_em=%s
+            WHERE job_id=%s AND status='PROCESSANDO'
             """,
-            (agora_iso(), job_id),
+            (agora_utc(), job_id),
         )
 
 
 def buscar_cache_sqlite(cnpj: str) -> Optional[Dict[str, Any]]:
+    """Mantém o nome antigo para preservar o restante do app."""
     if len(cnpj) != 14:
         return None
     with conectar_db() as conn:
         linha = conn.execute(
-            "SELECT resultado_json FROM cnpj_cache WHERE cnpj=?",
+            "SELECT resultado_json FROM public.cnpj_cache WHERE cnpj=%s",
             (cnpj,),
         ).fetchone()
     if not linha:
         return None
-    try:
-        return json.loads(linha["resultado_json"])
-    except Exception:
-        return None
+    resultado = linha.get("resultado_json")
+    if isinstance(resultado, dict):
+        return resultado
+    if isinstance(resultado, str):
+        try:
+            return json.loads(resultado)
+        except Exception:
+            return None
+    return None
 
 
 def salvar_cache_sqlite(cnpj: str, resultado: Dict[str, Any]) -> None:
+    """Mantém o nome antigo para preservar o restante do app."""
     if len(cnpj) != 14 or resultado.get("Erro Consulta"):
         return
     with conectar_db() as conn:
         conn.execute(
             """
-            INSERT INTO cnpj_cache(cnpj, resultado_json, fonte, atualizado_em)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO public.cnpj_cache(cnpj, resultado_json, fonte, atualizado_em)
+            VALUES (%s, %s, %s, %s)
             ON CONFLICT(cnpj) DO UPDATE SET
-                resultado_json=excluded.resultado_json,
-                fonte=excluded.fonte,
-                atualizado_em=excluded.atualizado_em
+                resultado_json=EXCLUDED.resultado_json,
+                fonte=EXCLUDED.fonte,
+                atualizado_em=EXCLUDED.atualizado_em
             """,
             (
                 cnpj,
-                json.dumps(resultado, ensure_ascii=False),
+                Jsonb(resultado),
                 resultado.get("Fonte Consulta", ""),
-                agora_iso(),
+                agora_utc(),
             ),
         )
 
 
-def obter_itens_para_processar(job_id: str, limite: int, incluir_erros: bool = False) -> List[sqlite3.Row]:
+def obter_itens_para_processar(job_id: str, limite: int, incluir_erros: bool = False) -> List[Dict[str, Any]]:
     status = ["PENDENTE"]
     if incluir_erros:
         status.append("ERRO")
-    placeholders = ",".join("?" for _ in status)
-    query = f"""
-        SELECT job_id, linha, cnpj, entrada_json, status, tentativas
-        FROM job_items
-        WHERE job_id=? AND status IN ({placeholders})
-        ORDER BY linha
-        LIMIT ?
-    """
     with conectar_db() as conn:
-        return conn.execute(query, [job_id, *status, limite]).fetchall()
+        return conn.execute(
+            """
+            SELECT job_id, linha, cnpj, entrada_json, status, tentativas
+            FROM public.job_items
+            WHERE job_id=%s AND status = ANY(%s)
+            ORDER BY linha
+            LIMIT %s
+            """,
+            (job_id, status, limite),
+        ).fetchall()
 
 
 def marcar_processando(job_id: str, linha: int) -> None:
     with conectar_db() as conn:
         conn.execute(
             """
-            UPDATE job_items
-            SET status='PROCESSANDO', tentativas=tentativas+1, atualizado_em=?
-            WHERE job_id=? AND linha=?
+            UPDATE public.job_items
+            SET status='PROCESSANDO', tentativas=tentativas+1, atualizado_em=%s
+            WHERE job_id=%s AND linha=%s
             """,
-            (agora_iso(), job_id, linha),
+            (agora_utc(), job_id, linha),
         )
 
 
@@ -718,20 +739,25 @@ def salvar_item_job(job_id: str, linha: int, resultado: Dict[str, Any]) -> None:
     with conectar_db() as conn:
         conn.execute(
             """
-            UPDATE job_items
-            SET status=?, resultado_json=?, erro=?, atualizado_em=?
-            WHERE job_id=? AND linha=?
+            UPDATE public.job_items
+            SET status=%s, resultado_json=%s, erro=%s, atualizado_em=%s
+            WHERE job_id=%s AND linha=%s
             """,
-            (status, json.dumps(resultado, ensure_ascii=False), erro, agora_iso(), job_id, linha),
+            (status, Jsonb(resultado), erro or None, agora_utc(), job_id, linha),
         )
-        pendentes = conn.execute(
-            "SELECT COUNT(*) FROM job_items WHERE job_id=? AND status IN ('PENDENTE','PROCESSANDO')",
+        linha_contagem = conn.execute(
+            """
+            SELECT COUNT(*) AS qtd
+            FROM public.job_items
+            WHERE job_id=%s AND status IN ('PENDENTE','PROCESSANDO')
+            """,
             (job_id,),
-        ).fetchone()[0]
+        ).fetchone()
+        pendentes = int(linha_contagem["qtd"] if linha_contagem else 0)
         novo_status = "CONCLUIDO" if pendentes == 0 else "EM_ANDAMENTO"
         conn.execute(
-            "UPDATE jobs SET status=?, atualizado_em=? WHERE job_id=?",
-            (novo_status, agora_iso(), job_id),
+            "UPDATE public.jobs SET status=%s, atualizado_em=%s WHERE job_id=%s",
+            (novo_status, agora_utc(), job_id),
         )
 
 
@@ -739,13 +765,25 @@ def reabrir_erros(job_id: str) -> int:
     with conectar_db() as conn:
         cursor = conn.execute(
             """
-            UPDATE job_items
-            SET status='PENDENTE', erro=NULL, atualizado_em=?
-            WHERE job_id=? AND status='ERRO'
+            UPDATE public.job_items
+            SET status='PENDENTE', erro=NULL, atualizado_em=%s
+            WHERE job_id=%s AND status='ERRO'
             """,
-            (agora_iso(), job_id),
+            (agora_utc(), job_id),
         )
         return int(cursor.rowcount or 0)
+
+
+def _json_para_dict(valor: Any) -> Dict[str, Any]:
+    if isinstance(valor, dict):
+        return valor
+    if isinstance(valor, str) and valor.strip():
+        try:
+            carregado = json.loads(valor)
+            return carregado if isinstance(carregado, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 def dataframe_job(job_id: str, somente_concluidos: bool = False) -> pd.DataFrame:
@@ -754,8 +792,8 @@ def dataframe_job(job_id: str, somente_concluidos: bool = False) -> pd.DataFrame
         linhas = conn.execute(
             f"""
             SELECT linha, entrada_json, resultado_json, status, tentativas, erro
-            FROM job_items
-            WHERE job_id=? {filtro}
+            FROM public.job_items
+            WHERE job_id=%s {filtro}
             ORDER BY linha
             """,
             (job_id,),
@@ -763,25 +801,17 @@ def dataframe_job(job_id: str, somente_concluidos: bool = False) -> pd.DataFrame
 
     registros = []
     for linha in linhas:
-        try:
-            entrada = json.loads(linha["entrada_json"] or "{}")
-        except Exception:
-            entrada = {}
-        try:
-            resultado = json.loads(linha["resultado_json"] or "{}")
-        except Exception:
-            resultado = {}
+        entrada = _json_para_dict(linha.get("entrada_json"))
+        resultado = _json_para_dict(linha.get("resultado_json"))
         combinado = dict(entrada)
         combinado.update(resultado)
         combinado["Status Processamento"] = linha["status"]
         combinado["Tentativas Processamento"] = linha["tentativas"]
-        if linha["erro"] and not combinado.get("Erro Consulta"):
+        if linha.get("erro") and not combinado.get("Erro Consulta"):
             combinado["Erro Consulta"] = linha["erro"]
         registros.append(combinado)
     return pd.DataFrame(registros)
 
-
-inicializar_db()
 
 # =========================================================
 # APIs E RETRY
@@ -1091,6 +1121,16 @@ def grafico_barras(df: pd.DataFrame, coluna: str, titulo: str, top: int = 15):
 # =========================================================
 exigir_login()
 
+conexao_ok, conexao_erro = testar_conexao_db()
+if not conexao_ok:
+    st.error(f"Não foi possível conectar ao Supabase: {conexao_erro}")
+    st.stop()
+
+tabelas_ok, tabelas_erro = validar_tabelas_db()
+if not tabelas_ok:
+    st.error(tabelas_erro)
+    st.stop()
+
 with st.sidebar:
     st.markdown("""
     <div style="padding:10px 4px 18px 4px;">
@@ -1161,7 +1201,7 @@ if pagina == "Consulta e Enriquecimento":
 
         st.markdown('<div class="main-card">', unsafe_allow_html=True)
         st.subheader("Processamento persistente")
-        st.caption(f"Identificador: {job_id} • Banco: {os.path.basename(DB_PATH)}")
+        st.caption(f"Identificador: {job_id} • Banco persistente: Supabase PostgreSQL")
 
         limite_execucao = st.number_input(
             "Quantidade máxima de CNPJs nesta execução",
