@@ -908,6 +908,37 @@ def coluna_existente(df: pd.DataFrame, candidatos: List[str]) -> Optional[str]:
     return None
 
 
+def combinar_colunas_preenchidas(df: pd.DataFrame, candidatos: List[str]) -> pd.Series:
+    """Retorna, linha a linha, o primeiro valor preenchido entre colunas equivalentes.
+
+    Isso evita que uma coluna auxiliar vazia, como ``Telefone Upload``, esconda os
+    dados existentes na coluna original da planilha, como ``TELEFONE`` ou ``Fone``.
+    """
+    colunas_encontradas: List[str] = []
+    candidatos_norm = {normalizar_nome_coluna(c) for c in candidatos}
+
+    # Mantém a prioridade definida em ``candidatos`` para nomes exatos.
+    for candidato in candidatos:
+        if candidato in df.columns and candidato not in colunas_encontradas:
+            colunas_encontradas.append(candidato)
+
+    # Inclui também variações de maiúsculas, acentos, hífens e espaços.
+    for coluna in df.columns:
+        if normalizar_nome_coluna(coluna) in candidatos_norm and coluna not in colunas_encontradas:
+            colunas_encontradas.append(coluna)
+
+    if not colunas_encontradas:
+        return pd.Series("", index=df.index, dtype="object")
+
+    resultado = pd.Series("", index=df.index, dtype="object")
+    for coluna in colunas_encontradas:
+        valores = df[coluna].fillna("").astype(str).str.strip()
+        vazios = resultado.astype(str).str.strip().eq("")
+        resultado.loc[vazios] = valores.loc[vazios]
+
+    return resultado
+
+
 def extrair_bairro_cidade_satelite(endereco: str) -> str:
     """Extrai o trecho depois do primeiro | e antes da vírgula.
 
@@ -935,8 +966,8 @@ def preparar_dashboard(df: pd.DataFrame) -> pd.DataFrame:
     col_mun = coluna_existente(df, ["Município", "Municipio", "Cidade"])
     col_uf = coluna_existente(df, ["UF"])
     col_cnpj = coluna_existente(df, ["CNPJ Formatado", "CNPJ Consultado", "CNPJ"])
-    col_tel = coluna_existente(df, ["Telefone Upload", "TELEFONE", "Telefone", "Fone", "Celular", "Whatsapp"])
-    col_email = coluna_existente(df, ["E-mail Upload", "E-MAIL", "Email", "E_mail", "Mail"])
+    candidatos_telefone = ["Telefone Upload", "TELEFONE", "Telefone", "Fone", "Celular", "Whatsapp"]
+    candidatos_email = ["E-mail Upload", "E-MAIL", "Email", "E_mail", "Mail"]
 
     if col_end:
         df["Cidade Satélite / Bairro"] = df[col_end].apply(extrair_bairro_cidade_satelite)
@@ -958,15 +989,10 @@ def preparar_dashboard(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["CNPJ Dashboard"] = ""
 
-    if col_tel:
-        df["Telefone Dashboard"] = df[col_tel].astype(str)
-    else:
-        df["Telefone Dashboard"] = ""
-
-    if col_email:
-        df["E-mail Dashboard"] = df[col_email].astype(str)
-    else:
-        df["E-mail Dashboard"] = ""
+    # Consolida as possíveis colunas de contato linha a linha. Assim, uma coluna
+    # auxiliar vazia não prevalece sobre a coluna original preenchida do upload.
+    df["Telefone Dashboard"] = combinar_colunas_preenchidas(df, candidatos_telefone)
+    df["E-mail Dashboard"] = combinar_colunas_preenchidas(df, candidatos_email)
 
     # Quando o Município estiver vazio, tenta extrair do endereço: "..., BRASILIA/DF - CEP ..."
     if col_end:
