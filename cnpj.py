@@ -939,6 +939,58 @@ def combinar_colunas_preenchidas(df: pd.DataFrame, candidatos: List[str]) -> pd.
     return resultado
 
 
+def combinar_telefone_dashboard(df: pd.DataFrame) -> pd.Series:
+    """Localiza e consolida o telefone sem depender do nome exato da coluna.
+
+    Preserva a prioridade de ``Telefone Upload`` e, quando ela estiver vazia,
+    procura o primeiro valor preenchido em colunas cujo nome indique telefone,
+    celular, WhatsApp, fone ou contato telefônico.
+    """
+    prioridade_exata = [
+        "Telefone Upload", "TELEFONE", "Telefone", "Fone",
+        "Celular", "Whatsapp", "WhatsApp", "Tel", "Contato Telefone",
+    ]
+
+    colunas_encontradas: List[str] = []
+
+    # Primeiro, mantém os nomes já previstos pelo sistema.
+    mapa_normalizado = {}
+    for coluna in df.columns:
+        mapa_normalizado.setdefault(normalizar_nome_coluna(coluna), []).append(coluna)
+
+    for candidato in prioridade_exata:
+        for coluna in mapa_normalizado.get(normalizar_nome_coluna(candidato), []):
+            if coluna not in colunas_encontradas:
+                colunas_encontradas.append(coluna)
+
+    # Depois, reconhece variações como TELEFONE_1, telefone comercial,
+    # celular cliente, número whatsapp, contato_fone etc.
+    termos_telefone = ("telefone", "fone", "celular", "whatsapp")
+    for coluna in df.columns:
+        nome = normalizar_nome_coluna(coluna)
+        eh_telefone = any(termo in nome for termo in termos_telefone)
+        eh_tel_curto = nome == "tel" or nome.startswith("tel_") or nome.endswith("_tel")
+        eh_contato_telefonico = "contato" in nome and ("numero" in nome or "tel" in nome)
+        if (eh_telefone or eh_tel_curto or eh_contato_telefonico) and coluna not in colunas_encontradas:
+            colunas_encontradas.append(coluna)
+
+    if not colunas_encontradas:
+        return pd.Series("", index=df.index, dtype="object")
+
+    resultado = pd.Series("", index=df.index, dtype="object")
+    marcadores_vazios = {"", "nan", "none", "null", "nat", "<na>"}
+
+    for coluna in colunas_encontradas:
+        valores = df[coluna].fillna("").astype(str).str.strip()
+        valores = valores.mask(valores.str.lower().isin(marcadores_vazios), "")
+        vazios = resultado.astype(str).str.strip().str.lower().isin(marcadores_vazios)
+        preenchidos = valores.ne("")
+        usar = vazios & preenchidos
+        resultado.loc[usar] = valores.loc[usar]
+
+    return resultado
+
+
 def extrair_bairro_cidade_satelite(endereco: str) -> str:
     """Extrai o trecho depois do primeiro | e antes da vírgula.
 
@@ -966,7 +1018,6 @@ def preparar_dashboard(df: pd.DataFrame) -> pd.DataFrame:
     col_mun = coluna_existente(df, ["Município", "Municipio", "Cidade"])
     col_uf = coluna_existente(df, ["UF"])
     col_cnpj = coluna_existente(df, ["CNPJ Formatado", "CNPJ Consultado", "CNPJ"])
-    candidatos_telefone = ["Telefone Upload", "TELEFONE", "Telefone", "Fone", "Celular", "Whatsapp"]
     candidatos_email = ["E-mail Upload", "E-MAIL", "Email", "E_mail", "Mail"]
 
     if col_end:
@@ -991,7 +1042,7 @@ def preparar_dashboard(df: pd.DataFrame) -> pd.DataFrame:
 
     # Consolida as possíveis colunas de contato linha a linha. Assim, uma coluna
     # auxiliar vazia não prevalece sobre a coluna original preenchida do upload.
-    df["Telefone Dashboard"] = combinar_colunas_preenchidas(df, candidatos_telefone)
+    df["Telefone Dashboard"] = combinar_telefone_dashboard(df)
     df["E-mail Dashboard"] = combinar_colunas_preenchidas(df, candidatos_email)
 
     # Quando o Município estiver vazio, tenta extrair do endereço: "..., BRASILIA/DF - CEP ..."
